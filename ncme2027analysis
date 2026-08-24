@@ -1,0 +1,388 @@
+# ------------------------------ Setup -----------------------------------------
+required_packages <- c("glmnet", "ncvreg", "dplyr", "data.table", 
+                       "foreach", "doParallel")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# ------------------------------ Parameters ------------------------------------
+p <- 1000                              # number of predictors
+n_vec <- c(10, 20, 50, 100, 500)       # sample sizes
+R <- 100                               # number of replications
+
+# >>>>>>>>>>>>>>>>> IMPORTANT: ADJUST THESE PATHS  <<<<<<<<<<<<<<<<<<
+data_dir <- "C:/Users/oramazan/Desktop/onur-yifan"            # where the data is stored
+out_dir  <- "C:/Users/oramazan/Desktop/onur-yifan"            # where the output is stored
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ------------------------------ Helper Functions -----------------------------
+calc_accuracy <- function(y_true, y_pred) {
+  ss_res <- sum((y_true - y_pred)^2)
+  ss_tot <- sum((y_true - mean(y_true))^2)
+  r2 <- 1 - ss_res / ss_tot
+  rmse <- sqrt(mean((y_true - y_pred)^2))
+  c(R2 = r2, RMSE = rmse)
+}
+
+jaccard_pair <- function(set1, set2) {
+  if (length(set1) == 0 && length(set2) == 0) return(1)
+  if (length(set1) == 0 || length(set2) == 0) return(0)
+  inter <- length(intersect(set1, set2))
+  union <- length(union(set1, set2))
+  inter / union
+}
+
+pairwise_jaccard_stats <- function(selected_list) {
+  n_sets <- length(selected_list)
+  if (n_sets < 2) return(c(mean = NA, sd = NA))
+  
+  pairs <- combn(1:n_sets, 2, simplify = FALSE)
+  jaccards <- sapply(pairs, function(idx) {
+    jaccard_pair(selected_list[[idx[1]]], selected_list[[idx[2]]])
+  })
+  c(mean = mean(jaccards, na.rm = TRUE), sd = sd(jaccards, na.rm = TRUE))
+}
+
+get_active <- function(model, method, lambda) {
+  if (method == "ridge") return(NA)
+  
+  coef_vec <- switch(method,
+                     ridge    = NA,
+                     lasso    = as.vector(coef(model$fit, s = lambda))[-1],
+                     enet     = as.vector(coef(model$fit, s = lambda))[-1],
+                     adalasso = as.vector(coef(model$fit, s = lambda))[-1],
+                     scad     = coef(model$fit, lambda = lambda)[-1],
+                     mcp      = coef(model$fit, lambda = lambda)[-1]
+  )
+  which(abs(coef_vec) > 1e-6)
+}
+
+# ------------------------------ Tuning Functions ------------------------------
+get_nfolds <- function(y) {
+  max(3, min(5, floor(length(y)/2)))
+}
+
+tune_ridge <- function(X, y) {
+  cv <- cv.glmnet(X, y, alpha = 0, nfolds = get_nfolds(y), intercept = TRUE)
+  list(lambda = cv$lambda.min, fit = cv$glmnet.fit)
+}
+tune_lasso <- function(X, y) {
+  cv <- cv.glmnet(X, y, alpha = 1, nfolds = get_nfolds(y), intercept = TRUE)
+  list(lambda = cv$lambda.min, fit = cv$glmnet.fit)
+}
+tune_enet <- function(X, y, alpha_grid = c(0.1, 0.3, 0.5, 0.7, 0.9)) {
+  best_alpha <- NULL; best_lambda <- NULL; best_cvm <- Inf
+  nf <- get_nfolds(y)
+  for (a in alpha_grid) {
+    cv <- cv.glmnet(X, y, alpha = a, nfolds = nf, intercept = TRUE)
+    if (min(cv$cvm) < best_cvm) {
+      best_cvm <- min(cv$cvm)
+      best_alpha <- a
+      best_lambda <- cv$lambda.min
+    }
+  }
+  fit <- glmnet(X, y, alpha = best_alpha, lambda = best_lambda, intercept = TRUE)
+  list(alpha = best_alpha, lambda = best_lambda, fit = fit)
+}
+tune_adalasso <- function(X, y) {
+  nf <- get_nfolds(y)
+  cv_ridge <- cv.glmnet(X, y, alpha = 0, nfolds = nf, intercept = TRUE)
+  ridge_coef <- as.numeric(coef(cv_ridge, s = "lambda.min"))[-1]
+  ridge_coef <- pmax(abs(ridge_coef), 1e-8)
+  weights <- 1 / ridge_coef
+  cv_lasso <- cv.glmnet(X, y, alpha = 1, penalty.factor = weights, nfolds = nf, intercept = TRUE)
+  list(lambda = cv_lasso$lambda.min, weights = weights, fit = cv_lasso$glmnet.fit)
+}
+tune_scad <- function(X, y) {
+  cv <- cv.ncvreg(X, y, penalty = "SCAD", nfolds = get_nfolds(y), family = "gaussian")
+  list(lambda = cv$lambda.min, fit = cv$fit)
+}
+tune_mcp <- function(X, y) {
+  cv <- cv.ncvreg(X, y, penalty = "MCP", nfolds = get_nfolds(y), family = "gaussian")
+  list(lambda = cv$lambda.min, fit = cv$fit)
+}
+
+# ------------------------------ Process One Method ---------------------------
+process_method <- function(method) {
+  cat("\n", paste(rep("=", 60), collapse = ""), "\n")
+  cat("Processing method:", method, "\n")
+  cat(paste(rep("=", 60), collapse = ""), "\n")
+  
+  abs_data_dir <- data_dir
+  abs_out_dir  <- out_dir
+  
+  if (!dir.exists(abs_out_dir)) dir.create(abs_out_dir, recursive = TRUE)
+  
+  out_file <- file.path(abs_out_dir, paste0("per_replication_results_", method, ".csv"))
+  active_rds_file <- file.path(abs_out_dir, paste0(method, "_active_sets.rds"))
+  
+  all_active <- list()
+  
+  n_cores <- 5
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  
+  clusterExport(cl, varlist = c(
+    "abs_data_dir", "n_vec", "calc_accuracy", "get_active", "get_nfolds",
+    "tune_ridge", "tune_lasso", "tune_enet", "tune_adalasso", "tune_scad", "tune_mcp", "method"
+  ), envir = environment())
+  
+  clusterEvalQ(cl, {
+    library(glmnet)
+    library(ncvreg)
+    library(data.table)
+    library(dplyr)
+  })
+  
+  batch_size <- 5
+  for (batch_start in seq(1, R, by = batch_size)) {
+    batch_end <- min(batch_start + batch_size - 1, R)
+    cat("  Processing batch:", batch_start, "to", batch_end, "\n")
+    
+    batch_results <- foreach(
+      rep = batch_start:batch_end,
+      .packages = c("glmnet", "ncvreg", "data.table", "dplyr"),
+      .errorhandling = "pass"
+    ) %dopar% {
+      
+      rep_results <- data.frame()
+      rep_active <- list()
+      
+      for (n in n_vec) {
+        
+        fname <- file.path(abs_data_dir, sprintf("sim_rep%03d_n%05d.csv", rep, n))
+        if (!file.exists(fname)) next
+        
+        df <- fread(fname)
+        y <- df$y
+        X <- as.matrix(df[, -1, with = FALSE])
+        
+        set.seed(rep * 100 + n * 10)
+        n_train <- floor(0.8 * n)
+        train_idx <- sample(1:n, size = n_train)
+        test_idx  <- setdiff(1:n, train_idx)
+        
+        X_train <- X[train_idx, , drop = FALSE]
+        y_train <- y[train_idx]
+        X_test  <- X[test_idx, , drop = FALSE]
+        y_test  <- y[test_idx]
+        
+        x_mean <- colMeans(X_train)
+        x_sd   <- apply(X_train, 2, sd)
+        x_sd[x_sd == 0] <- 1
+        
+        X_train <- scale(X_train, center = x_mean, scale = x_sd)
+        X_test  <- scale(X_test,  center = x_mean, scale = x_sd)
+        
+        params <- tryCatch({
+          switch(method,
+                 ridge    = tune_ridge(X_train, y_train),
+                 lasso    = tune_lasso(X_train, y_train),
+                 enet     = tune_enet(X_train, y_train),
+                 adalasso = tune_adalasso(X_train, y_train),
+                 scad     = tune_scad(X_train, y_train),
+                 mcp      = tune_mcp(X_train, y_train))
+        }, error = function(e) NULL)
+        
+        if (is.null(params)) next  
+        
+        pred_test <- tryCatch({
+          switch(method,
+                 ridge    = predict(params$fit, newx = X_test, s = params$lambda),
+                 lasso    = predict(params$fit, newx = X_test, s = params$lambda),
+                 enet     = predict(params$fit, newx = X_test, s = params$lambda),
+                 adalasso = predict(params$fit, newx = X_test, s = params$lambda),
+                 scad     = predict(params$fit, X = X_test, lambda = params$lambda),
+                 mcp      = predict(params$fit, X = X_test, lambda = params$lambda))
+        }, error = function(e) NULL)
+        
+        if (is.null(pred_test)) next
+        if (is.matrix(pred_test)) pred_test <- pred_test[, 1]
+        
+        acc <- calc_accuracy(y_test, pred_test)
+        
+        rep_results <- rbind(rep_results, data.frame(
+          rep       = rep,
+          n         = n,
+          method    = method,
+          R2        = acc["R2"],
+          RMSE      = acc["RMSE"],
+          stringsAsFactors = FALSE
+        ))
+        
+        if (method != "ridge") {
+          active_set <- tryCatch(get_active(params, method, params$lambda), error = function(e) numeric(0))
+          rep_active[[length(rep_active) + 1]] <- list(
+            rep = rep, n = n, active = active_set
+          )
+        }
+      }
+      list(results = rep_results, active = rep_active)
+    }
+    
+    batch_results_dfs <- lapply(batch_results, function(x) if (is.list(x) && "results" %in% names(x)) x$results else NULL)
+    batch_results_dfs <- batch_results_dfs[!sapply(batch_results_dfs, is.null)]
+    
+    if (length(batch_results_dfs) > 0) {
+      batch_df <- do.call(rbind, batch_results_dfs)
+      if (nrow(batch_df) > 0) {
+        if (batch_start == 1) {
+          write.csv(batch_df, file = out_file, row.names = FALSE)
+        } else {
+          existing <- tryCatch(read.csv(out_file), error = function(e) NULL)
+          if (!is.null(existing) && nrow(existing) > 0) {
+            combined <- rbind(existing, batch_df)
+            write.csv(combined, file = out_file, row.names = FALSE)
+          } else {
+            write.csv(batch_df, file = out_file, row.names = FALSE)
+          }
+        }
+      }
+    }
+    
+    if (method != "ridge") {
+      batch_active <- lapply(batch_results, function(x) if (is.list(x) && "active" %in% names(x)) x$active else NULL)
+      batch_active <- batch_active[!sapply(batch_active, is.null)]
+      for (act_list in batch_active) {
+        all_active <- c(all_active, act_list)
+      }
+    }
+  }
+  
+  stopCluster(cl)
+  closeAllConnections() # Safely flush all internal file connections
+  
+  # Compute Stability
+  stability_results <- data.frame()
+  if (method != "ridge" && length(all_active) > 0) {
+    active_df <- do.call(rbind, lapply(all_active, function(x) {
+      data.frame(rep = x$rep, n = x$n, active_id = I(list(x$active)), stringsAsFactors = FALSE)
+    }))
+    
+    for (n_val in n_vec) {
+      subset_idx <- which(active_df$n == n_val)
+      if (length(subset_idx) >= 2) {
+        sets <- active_df$active_id[subset_idx]
+        stats <- pairwise_jaccard_stats(sets)
+        stability_results <- rbind(stability_results, data.frame(
+          n = n_val, method = method,
+          Jaccard_stability_mean = stats["mean"], Jaccard_stability_sd = stats["sd"], stringsAsFactors = FALSE
+        ))
+      } else {
+        stability_results <- rbind(stability_results, data.frame(
+          n = n_val, method = method, Jaccard_stability_mean = NA, Jaccard_stability_sd = NA, stringsAsFactors = FALSE
+        ))
+      }
+    }
+  } else {
+    for (n_val in n_vec) {
+      stability_results <- rbind(stability_results, data.frame(
+        n = n_val, method = method, Jaccard_stability_mean = NA, Jaccard_stability_sd = NA, stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  stability_file <- file.path(abs_out_dir, paste0("stability_", method, ".csv"))
+  
+  # Safe write with retry mechanism against Windows file locking
+  write_success <- FALSE
+  for (attempt in 1:3) {
+    res <- tryCatch({
+      write.csv(stability_results, file = stability_file, row.names = FALSE)
+      TRUE
+    }, error = function(e) {
+      Sys.sleep(1)
+      FALSE
+    })
+    if (res) {
+      write_success <- TRUE
+      break
+    }
+  }
+  
+  if (!write_success) {
+    warning(paste("Could not lock-free write stability file for method:", method))
+  }
+  
+  return(TRUE)
+}
+
+# ------------------------------ Main Loop -------------------------------------
+methods <- c("ridge", "lasso", "enet", "adalasso", "scad", "mcp")
+accuracy_summary <- data.frame()
+stability_summary <- data.frame()
+
+for (method in methods) {
+  
+  success <- process_method(method)
+  
+  if (success) {
+    out_f <- file.path(out_dir, paste0("per_replication_results_", method, ".csv"))
+    if (file.exists(out_f) && file.info(out_f)$size > 10) {
+      method_acc <- tryCatch(read.csv(out_f), error = function(e) data.frame())
+      
+      if (nrow(method_acc) > 0) {
+        acc_summ <- method_acc %>%
+          group_by(n, method) %>%
+          summarise(
+            R2_mean        = mean(R2, na.rm = TRUE),
+            R2_sd          = sd(R2, na.rm = TRUE),
+            RMSE_mean      = mean(RMSE, na.rm = TRUE),
+            RMSE_sd        = sd(RMSE, na.rm = TRUE),
+            n_reps         = n(),
+            .groups        = "drop"
+          )
+        accuracy_summary <- rbind(accuracy_summary, acc_summ)
+      }
+    }
+    
+    stab_file <- file.path(out_dir, paste0("stability_", method, ".csv"))
+    if (file.exists(stab_file) && file.info(stab_file)$size > 10) {
+      stab <- tryCatch(read.csv(stab_file), error = function(e) data.frame())
+      if (nrow(stab) > 0) stability_summary <- rbind(stability_summary, stab)
+    }
+    
+    if (nrow(accuracy_summary) > 0) {
+      write.csv(accuracy_summary, file = file.path(out_dir, "accuracy_summary_all_methods.csv"), row.names = FALSE)
+    }
+    if (nrow(stability_summary) > 0) {
+      write.csv(stability_summary, file = file.path(out_dir, "stability_summary_all_methods.csv"), row.names = FALSE)
+    }
+    cat("Finished evaluating:", method, "\n")
+  }
+}
+
+# ------------------------------ Combine All Results --------------------------
+all_acc <- data.frame()
+for (method in methods) {
+  f <- file.path(out_dir, paste0("per_replication_results_", method, ".csv"))
+  if (file.exists(f) && file.info(f)$size > 10) {
+    tmp <- tryCatch(read.csv(f), error = function(e) NULL)
+    if (!is.null(tmp) && nrow(tmp) > 0) all_acc <- rbind(all_acc, tmp)
+  }
+}
+if (nrow(all_acc) > 0) write.csv(all_acc, file.path(out_dir, "per_replication_results_all.csv"), row.names = FALSE)
+
+all_stab <- data.frame()
+for (method in methods) {
+  f <- file.path(out_dir, paste0("stability_", method, ".csv"))
+  if (file.exists(f) && file.info(f)$size > 10) {
+    tmp <- tryCatch(read.csv(f), error = function(e) NULL)
+    if (!is.null(tmp) && nrow(tmp) > 0) all_stab <- rbind(all_stab, tmp)
+  }
+}
+if (nrow(all_stab) > 0) write.csv(all_stab, file.path(out_dir, "stability_results_all.csv"), row.names = FALSE)
+
+if (nrow(accuracy_summary) > 0 && nrow(stability_summary) > 0) {
+  final_summary <- accuracy_summary %>% left_join(stability_summary, by = c("n", "method"))
+  write.csv(final_summary, file = file.path(out_dir, "final_summary.csv"), row.names = FALSE)
+}
+
+cat("\nAll done! Results saved in:", out_dir, "\n")
