@@ -1,0 +1,8 @@
+"n","method","Jaccard_stability_mean","Jaccard_stability_sd"
+10,"ridge",NA,NA
+20,"ridge",NA,NA
+50,"ridge",NA,NA
+100,"ridge",NA,NA
+250,"ridge",NA,NA
+500,"ridge",NA,NA
+1000,"ridge",NA,NA
